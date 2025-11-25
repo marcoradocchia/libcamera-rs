@@ -2,15 +2,15 @@ use std::{
     collections::HashMap,
     ffi::CStr,
     io,
-    marker::PhantomData,
     ops::{Deref, DerefMut},
     ptr::NonNull,
-    sync::Mutex,
+    sync::{Arc, Mutex},
 };
 
 use libcamera_sys::*;
 
 use crate::{
+    camera_manager::CameraManagerInner,
     control::{ControlInfoMap, ControlList, PropertyList},
     request::Request,
     stream::{StreamConfigurationRef, StreamRole},
@@ -164,17 +164,14 @@ impl Drop for CameraConfiguration {
 ///
 /// Can be used to obtain camera parameters or supported stream configurations.
 /// In order to be used for capturing, it must be turned into an [ActiveCamera] by [Camera::acquire()].
-pub struct Camera<'d> {
+pub struct Camera {
     pub(crate) ptr: NonNull<libcamera_camera_t>,
-    _phantom: PhantomData<&'d ()>,
+    inner: Arc<CameraManagerInner>,
 }
 
-impl<'d> Camera<'d> {
-    pub(crate) unsafe fn from_ptr(ptr: NonNull<libcamera_camera_t>) -> Self {
-        Self {
-            ptr,
-            _phantom: Default::default(),
-        }
+impl Camera {
+    pub(crate) unsafe fn new(ptr: NonNull<libcamera_camera_t>, inner: Arc<CameraManagerInner>) -> Self {
+        Self { ptr, inner }
     }
 
     /// ID of the camera.
@@ -217,26 +214,33 @@ impl<'d> Camera<'d> {
     }
 
     /// Acquires exclusive rights to the camera, which allows changing configuration and capturing.
-    pub fn acquire(&self) -> io::Result<ActiveCamera<'d>> {
+    pub fn acquire(&self) -> io::Result<ActiveCamera> {
         let ret = unsafe { libcamera_camera_acquire(self.ptr.as_ptr()) };
         if ret < 0 {
             Err(io::Error::from_raw_os_error(ret))
         } else {
-            Ok(unsafe { ActiveCamera::from_ptr(NonNull::new(libcamera_camera_copy(self.ptr.as_ptr())).unwrap()) })
+            Ok(unsafe {
+                ActiveCamera::new(
+                    NonNull::new(libcamera_camera_copy(self.ptr.as_ptr())).unwrap(),
+                    Arc::clone(&self.inner),
+                )
+            })
         }
     }
 }
 
-impl Drop for Camera<'_> {
+
+unsafe impl Send for Camera {}
+unsafe impl Sync for Camera {}
+
+impl Drop for Camera {
     fn drop(&mut self) {
         unsafe { libcamera_camera_destroy(self.ptr.as_ptr()) }
     }
 }
 
 extern "C" fn camera_request_completed_cb(ptr: *mut core::ffi::c_void, req: *mut libcamera_request_t) {
-    let mut state = unsafe { &*(ptr as *const Mutex<ActiveCameraState<'_>>) }
-        .lock()
-        .unwrap();
+    let mut state = unsafe { &*(ptr as *const Mutex<ActiveCameraState>) }.lock().unwrap();
     let req = state.requests.remove(&req).unwrap();
 
     if let Some(cb) = &mut state.request_completed_cb {
@@ -244,13 +248,23 @@ extern "C" fn camera_request_completed_cb(ptr: *mut core::ffi::c_void, req: *mut
     }
 }
 
-#[derive(Default)]
-struct ActiveCameraState<'d> {
+struct ActiveCameraState {
+    _inner: Arc<CameraManagerInner>,
     /// List of queued requests that are yet to be executed.
     /// Used to temporarily store [Request] before returning it back to the user.
     requests: HashMap<*mut libcamera_request_t, Request>,
     /// Callback for libcamera `requestCompleted` signal.
-    request_completed_cb: Option<Box<dyn FnMut(Request) + Send + 'd>>,
+    request_completed_cb: Option<Box<dyn FnMut(Request) + Send>>,
+}
+
+impl ActiveCameraState {
+    fn new(inner: Arc<CameraManagerInner>) -> Self {
+        Self {
+            _inner: inner,
+            requests: HashMap::default(),
+            request_completed_cb: Option::default(),
+        }
+    }
 }
 
 /// An active instance of a camera.
@@ -258,29 +272,29 @@ struct ActiveCameraState<'d> {
 /// This gives exclusive access to the camera and allows capturing and modifying configuration.
 ///
 /// Obtained by [Camera::acquire()].
-pub struct ActiveCamera<'d> {
-    cam: Camera<'d>,
+pub struct ActiveCamera {
+    cam: Camera,
     /// Handle to disconnect `requestCompleted` signal.
     request_completed_handle: *mut libcamera_callback_handle_t,
     /// Internal state that is shared with callback handlers.
-    state: Box<Mutex<ActiveCameraState<'d>>>,
+    state: Box<Mutex<ActiveCameraState>>,
 }
 
-impl<'d> ActiveCamera<'d> {
-    pub(crate) unsafe fn from_ptr(ptr: NonNull<libcamera_camera_t>) -> Self {
-        let mut state = Box::new(Mutex::new(ActiveCameraState::default()));
+impl ActiveCamera {
+    pub(crate) unsafe fn new(ptr: NonNull<libcamera_camera_t>, inner: Arc<CameraManagerInner>) -> Self {
+        let mut state = Box::new(Mutex::new(ActiveCameraState::new(Arc::clone(&inner))));
 
         let request_completed_handle = unsafe {
             libcamera_camera_request_completed_connect(
                 ptr.as_ptr(),
                 Some(camera_request_completed_cb),
                 // state is valid for the lifetime of `ActiveCamera` and this callback will be disconnected on drop.
-                state.as_mut() as *mut Mutex<ActiveCameraState<'_>> as *mut _,
+                state.as_mut() as *mut Mutex<ActiveCameraState> as *mut _,
             )
         };
 
         Self {
-            cam: Camera::from_ptr(ptr),
+            cam: Camera::new(ptr, inner),
             request_completed_handle,
             state,
         }
@@ -293,7 +307,7 @@ impl<'d> ActiveCamera<'d> {
     ///
     /// Only one callback can be set at a time. If there was a previously set callback, it will be discarded when
     /// setting a new one.
-    pub fn on_request_completed(&mut self, cb: impl FnMut(Request) + Send + 'd) {
+    pub fn on_request_completed(&mut self, cb: impl FnMut(Request) + Send + 'static) {
         let mut state = self.state.lock().unwrap();
         state.request_completed_cb = Some(Box::new(cb));
     }
@@ -367,21 +381,21 @@ impl<'d> ActiveCamera<'d> {
     }
 }
 
-impl<'d> Deref for ActiveCamera<'d> {
-    type Target = Camera<'d>;
+impl Deref for ActiveCamera {
+    type Target = Camera;
 
     fn deref(&self) -> &Self::Target {
         &self.cam
     }
 }
 
-impl DerefMut for ActiveCamera<'_> {
+impl DerefMut for ActiveCamera {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.cam
     }
 }
 
-impl Drop for ActiveCamera<'_> {
+impl Drop for ActiveCamera {
     fn drop(&mut self) {
         unsafe {
             libcamera_camera_request_completed_disconnect(self.ptr.as_ptr(), self.request_completed_handle);
