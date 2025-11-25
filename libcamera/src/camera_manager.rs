@@ -2,12 +2,17 @@ use std::{
     ffi::{CStr, CString},
     io,
     ptr::NonNull,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
 };
 
 use libcamera_sys::*;
 
 use crate::{camera::Camera, logging::LoggingLevel, utils::handle_result};
+
+static CAMERA_MANAGER_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
 pub(crate) struct CameraManagerInner {
     ptr: NonNull<libcamera_camera_manager_t>,
@@ -15,6 +20,8 @@ pub(crate) struct CameraManagerInner {
 
 impl CameraManagerInner {
     pub(crate) unsafe fn new(ptr: NonNull<libcamera_camera_manager_t>) -> Self {
+        CAMERA_MANAGER_INITIALIZED.store(true, Ordering::SeqCst);
+
         Self { ptr }
     }
 }
@@ -25,6 +32,8 @@ impl Drop for CameraManagerInner {
             libcamera_camera_manager_stop(self.ptr.as_ptr());
             libcamera_camera_manager_destroy(self.ptr.as_ptr());
         }
+
+        CAMERA_MANAGER_INITIALIZED.store(false, Ordering::SeqCst);
     }
 }
 
@@ -39,6 +48,10 @@ pub struct CameraManager {
 impl CameraManager {
     /// Initializes `libcamera` and creates [Self].
     pub fn new() -> io::Result<Self> {
+        if CAMERA_MANAGER_INITIALIZED.load(Ordering::SeqCst) {
+            todo!("Return error about CameraManager already initialized");
+        }
+
         let ptr = NonNull::new(unsafe { libcamera_camera_manager_create() }).unwrap();
         let ret = unsafe { libcamera_camera_manager_start(ptr.as_ptr()) };
         handle_result(ret)?;
