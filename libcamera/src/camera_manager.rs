@@ -9,10 +9,19 @@ use std::{
 };
 
 use libcamera_sys::*;
+use thiserror::Error;
 
 use crate::{camera::Camera, logging::LoggingLevel, utils::handle_result};
 
 static CAMERA_MANAGER_INITIALIZED: AtomicBool = AtomicBool::new(false);
+
+#[derive(Debug, Error)]
+pub enum CameraManagerError {
+    #[error("Another CameraManager instance exists, libcamera already initialized")]
+    AlreadyInitialized,
+    #[error("Failed to start CameraManager")]
+    Start(#[from] io::Error),
+}
 
 pub(crate) struct CameraManagerInner {
     ptr: NonNull<libcamera_camera_manager_t>,
@@ -47,14 +56,14 @@ pub struct CameraManager {
 
 impl CameraManager {
     /// Initializes `libcamera` and creates [Self].
-    pub fn new() -> io::Result<Self> {
+    pub fn new() -> Result<Self, CameraManagerError> {
         if CAMERA_MANAGER_INITIALIZED.load(Ordering::SeqCst) {
-            todo!("Return error about CameraManager already initialized");
+            return Err(CameraManagerError::AlreadyInitialized);
         }
 
         let ptr = NonNull::new(unsafe { libcamera_camera_manager_create() }).unwrap();
         let ret = unsafe { libcamera_camera_manager_start(ptr.as_ptr()) };
-        handle_result(ret)?;
+        handle_result(ret).map_err(CameraManagerError::Start)?;
 
         let inner = unsafe { CameraManagerInner::new(ptr) };
         Ok(CameraManager { inner: Arc::new(inner) })
